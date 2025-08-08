@@ -1,0 +1,302 @@
+# FLAIR算法完整执行代码
+# 可以复制到Jupyter Notebook中运行
+
+# ==================== 导入模块 ====================
+import sys
+import os
+sys.path.append('.')
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import copy
+from typing import List, Dict, Tuple
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# 导入FLAIR相关模块
+from federated_learning.configuration import Configuration
+from federated_learning.server.flair_aggregator import FLAIRAggregator
+
+print("模块导入完成！")
+
+# ==================== 配置设置 ====================
+# 创建配置
+config = Configuration()
+config.NUMBER_OF_CLIENTS = 10
+config.CLIENTS_PER_ROUND = 5
+config.C_MAX = 1  # 每轮惩罚1个客户端
+config.FLAIR_MU = 0.9  # 声誉衰减因子
+config.AGGREGATION_METHOD = 'flair'
+
+print(f"配置信息:")
+print(f"- 总客户端数: {config.NUMBER_OF_CLIENTS}")
+print(f"- 每轮参与客户端数: {config.CLIENTS_PER_ROUND}")
+print(f"- 每轮惩罚客户端数: {config.C_MAX}")
+print(f"- 声誉衰减因子: {config.FLAIR_MU}")
+
+# ==================== 创建FLAIR聚合器 ====================
+flair_aggregator = FLAIRAggregator(config)
+print("FLAIR聚合器创建成功！")
+
+# ==================== 参数生成函数 ====================
+def create_mock_parameters_for_round(config, round_idx, attack_type='normal'):
+    """为指定轮次创建模拟的客户端参数"""
+    parameters_list = []
+    
+    # 创建正常客户端的参数
+    for i in range(config.CLIENTS_PER_ROUND - 2):
+        # 正常客户端：参数变化较小且方向一致
+        base_value = 0.1 * (1 + 0.05 * round_idx)
+        params = {
+            'layer1.weight': torch.randn(64, 784) * base_value,
+            'layer1.bias': torch.randn(64) * base_value,
+            'layer2.weight': torch.randn(10, 64) * base_value,
+            'layer2.bias': torch.randn(10) * base_value
+        }
+        parameters_list.append(params)
+    
+    # 创建恶意客户端1：方向反转攻击
+    if round_idx > 0 and attack_type == 'sign_flip':
+        # 方向反转攻击：参数方向与正常客户端相反
+        base_value = 0.1 * (1 + 0.05 * round_idx)
+        params = {
+            'layer1.weight': torch.randn(64, 784) * base_value * (-1),
+            'layer1.bias': torch.randn(64) * base_value * (-1),
+            'layer2.weight': torch.randn(10, 64) * base_value * (-1),
+            'layer2.bias': torch.randn(10) * base_value * (-1)
+        }
+    else:
+        # 第一轮或正常情况
+        base_value = 0.1 * (1 + 0.05 * round_idx)
+        params = {
+            'layer1.weight': torch.randn(64, 784) * base_value,
+            'layer1.bias': torch.randn(64) * base_value,
+            'layer2.weight': torch.randn(10, 64) * base_value,
+            'layer2.bias': torch.randn(10) * base_value
+        }
+    parameters_list.append(params)
+    
+    # 创建恶意客户端2：伪装攻击（参数变化很小）
+    if attack_type == 'stealth':
+        # 伪装攻击：参数变化很小，试图逃避检测
+        params = {
+            'layer1.weight': torch.randn(64, 784) * 0.001,  # 变化很小
+            'layer1.bias': torch.randn(64) * 0.001,
+            'layer2.weight': torch.randn(10, 64) * 0.001,
+            'layer2.bias': torch.randn(10) * 0.001
+        }
+    else:
+        # 正常参数
+        base_value = 0.1 * (1 + 0.05 * round_idx)
+        params = {
+            'layer1.weight': torch.randn(64, 784) * base_value,
+            'layer1.bias': torch.randn(64) * base_value,
+            'layer2.weight': torch.randn(10, 64) * base_value,
+            'layer2.bias': torch.randn(10) * base_value
+        }
+    parameters_list.append(params)
+    
+    return parameters_list
+
+# ==================== 分析函数 ====================
+def compute_parameter_norm(params):
+    """计算参数范数"""
+    total_norm = 0.0
+    for name, param in params.items():
+        total_norm += torch.norm(param).item() ** 2
+    return np.sqrt(total_norm)
+
+def analyze_flair_results(client_parameters, aggregated_params, reputation_scores, round_idx):
+    """分析FLAIR结果"""
+    print(f"\n=== 第 {round_idx + 1} 轮结果分析 ===")
+    
+    # 计算每个客户端参数的范数
+    client_norms = []
+    for i, params in enumerate(client_parameters):
+        norm = compute_parameter_norm(params)
+        client_norms.append(norm)
+        client_type = "恶意" if i >= len(client_parameters) - 2 else "正常"
+        print(f"客户端 {i} ({client_type}): 范数 = {norm:.4f}, 声誉 = {reputation_scores[i]:.3f}")
+    
+    # 计算聚合结果的范数
+    result_norm = compute_parameter_norm(aggregated_params)
+    print(f"\n聚合结果范数: {result_norm:.4f}")
+    
+    # 识别声誉最低的客户端
+    min_reputation_idx = np.argmin(reputation_scores)
+    print(f"声誉最低客户端: {min_reputation_idx} (声誉: {reputation_scores[min_reputation_idx]:.3f})")
+    
+    return client_norms, result_norm
+
+# ==================== 主执行逻辑 ====================
+# 模拟多轮训练
+num_rounds = 15
+reputation_history = []
+norm_history = []
+
+print(f"开始模拟 {num_rounds} 轮训练...")
+
+for round_idx in range(num_rounds):
+    print(f"\n--- 第 {round_idx + 1} 轮 ---")
+    
+    # 选择攻击类型
+    if round_idx < 5:
+        attack_type = 'normal'
+    elif round_idx < 10:
+        attack_type = 'sign_flip'
+    else:
+        attack_type = 'stealth'
+    
+    # 创建模拟的客户端参数
+    client_parameters = create_mock_parameters_for_round(config, round_idx, attack_type)
+    client_indices = list(range(config.CLIENTS_PER_ROUND))
+    
+    # 执行FLAIR聚合
+    aggregated_params = flair_aggregator.flair_aggregate(client_parameters, client_indices)
+    
+    # 获取声誉分数
+    reputation_scores = flair_aggregator.get_reputation_scores()
+    reputation_history.append(reputation_scores.copy())
+    
+    # 获取聚合权重
+    weights = flair_aggregator.get_client_weights(client_indices)
+    
+    print(f"攻击类型: {attack_type}")
+    print(f"声誉分数: {[f'{r:.3f}' for r in reputation_scores]}")
+    print(f"聚合权重: {[f'{w:.3f}' for w in weights]}")
+    
+    # 分析结果
+    client_norms, result_norm = analyze_flair_results(client_parameters, aggregated_params, reputation_scores, round_idx)
+    norm_history.append(result_norm)
+
+print("\n训练完成！")
+
+# ==================== 可视化结果 ====================
+# 可视化声誉变化
+reputation_history = np.array(reputation_history)
+
+plt.figure(figsize=(15, 10))
+
+# 创建子图
+plt.subplot(2, 2, 1)
+for client_idx in range(reputation_history.shape[1]):
+    plt.plot(range(1, num_rounds + 1), reputation_history[:, client_idx], 
+             marker='o', label=f'客户端 {client_idx}', linewidth=2)
+
+plt.xlabel('训练轮次')
+plt.ylabel('声誉分数')
+plt.title('FLAIR算法声誉分数变化')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# 聚合权重变化
+plt.subplot(2, 2, 2)
+weights_history = []
+for round_idx in range(num_rounds):
+    weights = flair_aggregator.get_client_weights(list(range(config.CLIENTS_PER_ROUND)))
+    weights_history.append(weights)
+
+weights_history = np.array(weights_history)
+for client_idx in range(weights_history.shape[1]):
+    plt.plot(range(1, num_rounds + 1), weights_history[:, client_idx], 
+             marker='s', label=f'客户端 {client_idx}', linewidth=2)
+
+plt.xlabel('训练轮次')
+plt.ylabel('聚合权重')
+plt.title('客户端聚合权重变化')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# 模型范数变化
+plt.subplot(2, 2, 3)
+plt.plot(range(1, num_rounds + 1), norm_history, marker='^', linewidth=2, color='red')
+plt.xlabel('训练轮次')
+plt.ylabel('模型范数')
+plt.title('聚合模型范数变化')
+plt.grid(True, alpha=0.3)
+
+# 声誉分布热力图
+plt.subplot(2, 2, 4)
+im = plt.imshow(reputation_history.T, cmap='RdYlBu_r', aspect='auto')
+plt.colorbar(im)
+plt.xlabel('训练轮次')
+plt.ylabel('客户端索引')
+plt.title('声誉分数热力图')
+plt.yticks(range(config.NUMBER_OF_CLIENTS))
+
+plt.tight_layout()
+plt.show()
+
+print("可视化完成！")
+
+# ==================== 效果分析 ====================
+# 分析FLAIR算法的效果
+print("=== FLAIR算法效果分析 ===\n")
+
+# 1. 声誉分数分析
+final_reputation = reputation_history[-1]
+print(f"最终声誉分数:")
+for i, score in enumerate(final_reputation):
+    client_type = "恶意" if i >= config.CLIENTS_PER_ROUND - 2 else "正常"
+    print(f"客户端 {i} ({client_type}): {score:.3f}")
+
+# 2. 恶意客户端检测效果
+malicious_clients = [config.CLIENTS_PER_ROUND - 2, config.CLIENTS_PER_ROUND - 1]
+normal_clients = list(range(config.CLIENTS_PER_ROUND - 2))
+
+avg_malicious_reputation = np.mean([final_reputation[i] for i in malicious_clients])
+avg_normal_reputation = np.mean([final_reputation[i] for i in normal_clients])
+
+print(f"\n恶意客户端平均声誉: {avg_malicious_reputation:.3f}")
+print(f"正常客户端平均声誉: {avg_normal_reputation:.3f}")
+print(f"声誉差异: {avg_normal_reputation - avg_malicious_reputation:.3f}")
+
+# 3. 检测成功率
+detection_success = 0
+for i in malicious_clients:
+    if final_reputation[i] < avg_normal_reputation:
+        detection_success += 1
+
+detection_rate = detection_success / len(malicious_clients) * 100
+print(f"恶意客户端检测成功率: {detection_rate:.1f}%")
+
+# 4. 模型稳定性分析
+norm_variance = np.var(norm_history)
+print(f"\n模型范数方差: {norm_variance:.4f}")
+if norm_variance < 0.1:
+    print("✓ 模型稳定性良好")
+else:
+    print("⚠ 模型稳定性需要改进")
+
+# ==================== 不同攻击类型分析 ====================
+# 比较不同攻击类型的检测效果
+print("=== 不同攻击类型检测效果比较 ===\n")
+
+# 分析不同阶段的声誉变化
+phases = [
+    (0, 5, "正常阶段"),
+    (5, 10, "方向反转攻击阶段"),
+    (10, 15, "伪装攻击阶段")
+]
+
+for start, end, phase_name in phases:
+    phase_reputation = reputation_history[start:end]
+    
+    # 计算声誉变化
+    reputation_change = phase_reputation[-1] - phase_reputation[0]
+    
+    print(f"{phase_name}:")
+    for i, change in enumerate(reputation_change):
+        client_type = "恶意" if i >= config.CLIENTS_PER_ROUND - 2 else "正常"
+        print(f"  客户端 {i} ({client_type}): 声誉变化 {change:+.3f}")
+    print()
+
+print("=== FLAIR算法演示完成 ===")
+print("通过这个演示，我们可以看到FLAIR算法如何：")
+print("1. 识别恶意客户端：通过分析客户端更新的方向变化")
+print("2. 动态调整声誉：基于Flip-Score更新客户端声誉分数")
+print("3. 智能聚合：使用声誉分数作为聚合权重")
+print("4. 渐进式防御：随着训练进行，恶意客户端的影响逐渐被边缘化") 
